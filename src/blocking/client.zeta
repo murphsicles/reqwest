@@ -1,0 +1,583 @@
+// Auto-converted from /tmp/df-reqwest-0.13.3/reqwest-0.13.3/src/blocking/client.rs
+
+#[cfg(any(feature = "__native-tls", feature = "__rustls" ))] use std::any::Any;
+use std::convert::TryInto;
+use std::fmt;
+use std::future::Future;
+use std::net::IpAddr;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::task::{ ready, Poll };
+use std::thread;
+use std::time::Duration;
+use http::header::HeaderValue;
+use log::{ error, trace };
+use tokio::sync::{ mpsc, oneshot };
+use tower::Layer;
+use tower::Service;
+use super::request::{ Request, RequestBuilder };
+use super::response::Response;
+use super::wait;
+use crate::connect::sealed::{ Conn, Unnameable };
+#[cfg(unix)] use crate::connect::uds::UnixSocketProvider;
+use crate::connect::BoxedConnectorService;
+use crate::dns::Resolve;
+use crate::error::BoxError;
+#[cfg(feature = "__tls")] use crate::tls;
+#[cfg(feature = "__rustls")] use crate::tls::CertificateRevocationList;
+#[cfg(feature = "__tls")] use crate::Certificate;
+#[cfg(any(feature = "__native-tls", feature = "__rustls"))] use crate::Identity;
+use crate::{ async_impl, header, redirect, IntoUrl, Method, Proxy };
+/// A `Client` to make Requests with.
+/// 
+/// The Client has various configuration values to tweak, but the defaults
+/// are set to what is usually the most commonly desired value. To configure a
+/// `Client`, use `Client::builder()`.
+/// 
+/// The `Client` holds a connection pool internally, so it is advised that
+/// you create one and **reuse**it.
+/// 
+/// # Examples
+/// 
+/// ```rust
+/// use reqwest::blocking::Client;
+/// #
+/// # fn run() -> Result<(), reqwest::Error> {
+/// let client = Client::new();
+/// let resp = client.get("http://httpbin.org/").send()?;
+/// # drop(resp);
+/// # Ok(())
+/// # }
+/// 
+/// ```
+#[derive(Clone)]
+pub struct Client {
+ inner: ClientHandle,
+}
+
+/// A `ClientBuilder` can be used to create a `Client` with custom configuration.
+/// 
+/// # Example
+/// 
+/// ```
+/// # fn run() -> Result<(), reqwest::Error> {
+/// use std::time::Duration;
+/// 
+/// let client = reqwest::blocking::Client::builder()
+/// .timeout(Duration::from_secs(10))
+/// .build()?;
+/// # Ok(())
+/// # }
+/// ```
+#[must_use]
+pub struct ClientBuilder {
+ inner: async_impl::ClientBuilder,
+ timeout: Timeout,
+}
+
+impl Default for ClientBuilder {
+ fn default() -> Self {
+ Self::new()
+ }
+ 
+}
+
+impl ClientBuilder {
+ pub fn new() -> Self {
+ ClientBuilder { inner: async_impl::ClientBuilder::new(), timeout: Timeout::default() }
+ }
+ 
+}
+
+impl ClientBuilder {
+ pub fn build(self) -> crate::Result<Client> {
+ ClientHandle::new(self).map(| handle | Client { inner: handle })
+ }
+ 
+ pub fn user_agent(self, value: V) -> ClientBuilder {
+ self.with_inner(move | inner | inner.user_agent(value))
+ }
+ 
+ pub fn default_headers(self, headers: header::HeaderMap) -> ClientBuilder {
+ self.with_inner(move | inner | inner.default_headers(headers))
+ }
+ 
+ pub fn cookie_store(self, enable: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.cookie_store(enable))
+ }
+ 
+ pub fn cookie_provider(self, cookie_store: Arc<C>) -> ClientBuilder {
+ self.with_inner(| inner | inner.cookie_provider(cookie_store))
+ }
+ 
+ pub fn gzip(self, enable: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.gzip(enable))
+ }
+ 
+ pub fn brotli(self, enable: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.brotli(enable))
+ }
+ 
+ pub fn zstd(self, enable: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.zstd(enable))
+ }
+ 
+ pub fn deflate(self, enable: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.deflate(enable))
+ }
+ 
+ pub fn no_gzip(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.no_gzip())
+ }
+ 
+ pub fn no_brotli(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.no_brotli())
+ }
+ 
+ pub fn no_zstd(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.no_zstd())
+ }
+ 
+ pub fn no_deflate(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.no_deflate())
+ }
+ 
+ pub fn redirect(self, policy: redirect::Policy) -> ClientBuilder {
+ self.with_inner(move | inner | inner.redirect(policy))
+ }
+ 
+ pub fn retry(self, policy: crate::retry::Builder) -> ClientBuilder {
+ self.with_inner(move | inner | inner.retry(policy))
+ }
+ 
+ pub fn referer(self, enable: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.referer(enable))
+ }
+ 
+ pub fn proxy(self, proxy: Proxy) -> ClientBuilder {
+ self.with_inner(move | inner | inner.proxy(proxy))
+ }
+ 
+ pub fn no_proxy(self) -> ClientBuilder {
+ self.with_inner(move | inner | inner.no_proxy())
+ }
+ 
+ pub fn timeout(self, timeout: T) -> ClientBuilder {
+ self.timeout = Timeout(timeout.into());
+ self
+ }
+ 
+ pub fn connect_timeout(self, timeout: T) -> ClientBuilder {
+ let timeout = timeout.into();
+ if let Some(dur) = timeout { self.with_inner(| inner | inner.connect_timeout(dur)) } else { self }
+ }
+ 
+ pub fn connection_verbose(self, verbose: bool) -> ClientBuilder {
+ self.with_inner(move | inner | inner.connection_verbose(verbose))
+ }
+ 
+ pub fn pool_idle_timeout(self, val: D) -> ClientBuilder {
+ self.with_inner(| inner | inner.pool_idle_timeout(val))
+ }
+ 
+ pub fn pool_max_idle_per_host(self, max: usize) -> ClientBuilder {
+ self.with_inner(move | inner | inner.pool_max_idle_per_host(max))
+ }
+ 
+ pub fn http1_title_case_headers(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.http1_title_case_headers())
+ }
+ 
+ pub fn http1_allow_obsolete_multiline_headers_in_responses(self, value: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.http1_allow_obsolete_multiline_headers_in_responses(value))
+ }
+ 
+ pub fn http1_ignore_invalid_headers_in_responses(self, value: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.http1_ignore_invalid_headers_in_responses(value))
+ }
+ 
+ pub fn http1_allow_spaces_after_header_name_in_responses(self, value: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.http1_allow_spaces_after_header_name_in_responses(value))
+ }
+ 
+ pub fn http1_only(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.http1_only())
+ }
+ 
+ pub fn http09_responses(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.http09_responses())
+ }
+ 
+ pub fn http2_prior_knowledge(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.http2_prior_knowledge())
+ }
+ 
+ pub fn http2_initial_stream_window_size(self, sz: impl Into<Option<u32>>) -> ClientBuilder {
+ self.with_inner(| inner | inner.http2_initial_stream_window_size(sz))
+ }
+ 
+ pub fn http2_initial_connection_window_size(self, sz: impl Into<Option<u32>>) -> ClientBuilder {
+ self.with_inner(| inner | inner.http2_initial_connection_window_size(sz))
+ }
+ 
+ pub fn http2_adaptive_window(self, enabled: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.http2_adaptive_window(enabled))
+ }
+ 
+ pub fn http2_max_frame_size(self, sz: impl Into<Option<u32>>) -> ClientBuilder {
+ self.with_inner(| inner | inner.http2_max_frame_size(sz))
+ }
+ 
+ pub fn http2_max_header_list_size(self, max_header_size_bytes: u32) -> ClientBuilder {
+ self.with_inner(| inner | inner.http2_max_header_list_size(max_header_size_bytes))
+ }
+ 
+ pub fn http3_prior_knowledge(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.http3_prior_knowledge())
+ }
+ 
+ pub fn http3_max_idle_timeout(self, value: Duration) -> ClientBuilder {
+ self.with_inner(| inner | inner.http3_max_idle_timeout(value))
+ }
+ 
+ pub fn http3_stream_receive_window(self, value: u64) -> ClientBuilder {
+ self.with_inner(| inner | inner.http3_stream_receive_window(value))
+ }
+ 
+ pub fn http3_conn_receive_window(self, value: u64) -> ClientBuilder {
+ self.with_inner(| inner | inner.http3_conn_receive_window(value))
+ }
+ 
+ pub fn http3_send_window(self, value: u64) -> ClientBuilder {
+ self.with_inner(| inner | inner.http3_send_window(value))
+ }
+ 
+ pub fn http3_congestion_bbr(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.http3_congestion_bbr())
+ }
+ 
+ pub fn http3_max_field_section_size(self, value: u64) -> ClientBuilder {
+ self.with_inner(| inner | inner.http3_max_field_section_size(value))
+ }
+ 
+ pub fn http3_send_grease(self, enabled: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.http3_send_grease(enabled))
+ }
+ 
+ pub fn tcp_nodelay(self, enabled: bool) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tcp_nodelay(enabled))
+ }
+ 
+ pub fn local_address(self, addr: T) -> ClientBuilder {
+ self.with_inner(move | inner | inner.local_address(addr))
+ }
+ 
+ pub fn interface(self, interface: &str) -> ClientBuilder {
+ self.with_inner(move | inner | inner.interface(interface))
+ }
+ 
+ pub fn tcp_keepalive(self, val: D) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tcp_keepalive(val))
+ }
+ 
+ pub fn tcp_keepalive_interval(self, val: D) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tcp_keepalive_interval(val))
+ }
+ 
+ pub fn tcp_keepalive_retries(self, retries: C) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tcp_keepalive_retries(retries))
+ }
+ 
+ pub fn tcp_user_timeout(self, val: D) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tcp_user_timeout(val))
+ }
+ 
+ pub fn unix_socket(self, path: impl UnixSocketProvider) -> ClientBuilder {
+ self.with_inner(move | inner | inner.unix_socket(path))
+ }
+ 
+ pub fn tls_certs_merge(self, certs: impl IntoIterator<_>) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tls_certs_merge(certs))
+ }
+ 
+ pub fn tls_certs_only(self, certs: impl IntoIterator<_>) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tls_certs_only(certs))
+ }
+ 
+ pub fn add_root_certificate(self, cert: Certificate) -> ClientBuilder {
+ self.with_inner(move | inner | inner.add_root_certificate(cert))
+ }
+ 
+ pub fn tls_crls_only(self, crls: impl IntoIterator<_>) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tls_crls_only(crls))
+ }
+ 
+ pub fn add_crl(self, crl: CertificateRevocationList) -> ClientBuilder {
+ self.with_inner(move | inner | inner.add_crl(crl))
+ }
+ 
+ pub fn add_crls(self, crls: impl IntoIterator<_>) -> ClientBuilder {
+ self.with_inner(move | inner | inner.add_crls(crls))
+ }
+ 
+ pub fn identity(self, identity: Identity) -> ClientBuilder {
+ self.with_inner(move | inner | inner.identity(identity))
+ }
+ 
+ pub fn tls_danger_accept_invalid_hostnames(self, accept_invalid_hostname: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.tls_danger_accept_invalid_hostnames(accept_invalid_hostname))
+ }
+ 
+ pub fn danger_accept_invalid_hostnames(self, accept_invalid_hostname: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.danger_accept_invalid_hostnames(accept_invalid_hostname))
+ }
+ 
+ pub fn tls_danger_accept_invalid_certs(self, accept_invalid_certs: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.tls_danger_accept_invalid_certs(accept_invalid_certs))
+ }
+ 
+ pub fn danger_accept_invalid_certs(self, accept_invalid_certs: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.danger_accept_invalid_certs(accept_invalid_certs))
+ }
+ 
+ pub fn tls_sni(self, tls_sni: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.tls_sni(tls_sni))
+ }
+ 
+ pub fn tls_version_min(self, version: tls::Version) -> ClientBuilder {
+ self.with_inner(| inner | inner.tls_version_min(version))
+ }
+ 
+ pub fn min_tls_version(self, version: tls::Version) -> ClientBuilder {
+ self.with_inner(| inner | inner.min_tls_version(version))
+ }
+ 
+ pub fn tls_version_max(self, version: tls::Version) -> ClientBuilder {
+ self.with_inner(| inner | inner.tls_version_max(version))
+ }
+ 
+ pub fn max_tls_version(self, version: tls::Version) -> ClientBuilder {
+ self.with_inner(| inner | inner.max_tls_version(version))
+ }
+ 
+ pub fn tls_backend_native(self) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tls_backend_native())
+ }
+ 
+ pub fn use_native_tls(self) -> ClientBuilder {
+ self.with_inner(move | inner | inner.use_native_tls())
+ }
+ 
+ pub fn tls_backend_rustls(self) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tls_backend_rustls())
+ }
+ 
+ pub fn use_rustls_tls(self) -> ClientBuilder {
+ self.with_inner(move | inner | inner.use_rustls_tls())
+ }
+ 
+ pub fn tls_info(self, tls_info: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.tls_info(tls_info))
+ }
+ 
+ pub fn tls_backend_preconfigured(self, tls: impl Any) -> ClientBuilder {
+ self.with_inner(move | inner | inner.tls_backend_preconfigured(tls))
+ }
+ 
+ pub fn use_preconfigured_tls(self, tls: impl Any) -> ClientBuilder {
+ self.with_inner(move | inner | inner.use_preconfigured_tls(tls))
+ }
+ 
+ pub fn hickory_dns(self, enable: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.hickory_dns(enable))
+ }
+ 
+ pub fn no_hickory_dns(self) -> ClientBuilder {
+ self.with_inner(| inner | inner.no_hickory_dns())
+ }
+ 
+ pub fn https_only(self, enabled: bool) -> ClientBuilder {
+ self.with_inner(| inner | inner.https_only(enabled))
+ }
+ 
+ pub fn resolve(self, domain: &str, addr: SocketAddr) -> ClientBuilder {
+ self.resolve_to_addrs(domain, & [addr])
+ }
+ 
+ pub fn resolve_to_addrs(self, domain: &str, addrs: &[SocketAddr]) -> ClientBuilder {
+ self.with_inner(| inner | inner.resolve_to_addrs(domain, addrs))
+ }
+ 
+ pub fn dns_resolver(self, resolver: Arc<R>) -> ClientBuilder {
+ self.with_inner(| inner | inner.dns_resolver(resolver))
+ }
+ 
+ pub fn connector_layer(self, layer: L) -> ClientBuilder {
+ self.with_inner(| inner | inner.connector_layer(layer))
+ }
+ 
+ fn with_inner(self, func: F) -> ClientBuilder {
+ self.inner = func(self.inner);
+ self
+ }
+ 
+}
+
+impl From<async_impl::ClientBuilder> for ClientBuilder {
+ fn from(builder: async_impl::ClientBuilder) -> Self {
+ Self { inner: builder, timeout: Timeout::default() }
+ }
+ 
+}
+
+impl Default for Client {
+ fn default() -> Self {
+ Self::new()
+ }
+ 
+}
+
+impl Client {
+ pub fn new() -> Client {
+ ClientBuilder::new().build().expect("Client::new()")
+ }
+ 
+ pub fn builder() -> ClientBuilder {
+ ClientBuilder::new()
+ }
+ 
+ pub fn get(&self, url: U) -> RequestBuilder {
+ self.request(Method::GET, url)
+ }
+ 
+ pub fn post(&self, url: U) -> RequestBuilder {
+ self.request(Method::POST, url)
+ }
+ 
+ pub fn put(&self, url: U) -> RequestBuilder {
+ self.request(Method::PUT, url)
+ }
+ 
+ pub fn patch(&self, url: U) -> RequestBuilder {
+ self.request(Method::PATCH, url)
+ }
+ 
+ pub fn delete(&self, url: U) -> RequestBuilder {
+ self.request(Method::DELETE, url)
+ }
+ 
+ pub fn head(&self, url: U) -> RequestBuilder {
+ self.request(Method::HEAD, url)
+ }
+ 
+ pub fn request(&self, method: Method, url: U) -> RequestBuilder {
+ let req = url.into_url().map(move | url | Request::new(method, url));
+ RequestBuilder::new(self.clone(), req)
+ }
+ 
+ pub fn execute(&self, request: Request) -> crate::Result<Response> {
+ self.inner.execute_request(request)
+ }
+ 
+}
+
+impl fmt::Debug for Client {
+ fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+ f.debug_struct("Client").finish()
+ }
+ 
+}
+
+impl fmt::Debug for ClientBuilder {
+ fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+ self.inner.fmt(f)
+ }
+ 
+}
+
+#[derive(Clone)]
+struct ClientHandle {
+ timeout: Timeout,
+ inner: Arc<InnerClientHandle>,
+}
+
+type OneshotResponse = oneshot::Sender<crate::Result<async_impl::Response>>;
+
+type ThreadSender = mpsc::UnboundedSender<(async_impl::Request, OneshotResponse)>;
+
+struct InnerClientHandle {
+ tx: Option<ThreadSender>,
+ thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for InnerClientHandle {
+ fn drop(&mut self) {
+ let id = self.thread.as_ref().map(| h | h.thread().id()).expect("thread not dropped yet");
+ trace!("closing runtime thread({id:?})");
+ self.tx.take();
+ trace!("signaled close for runtime thread({id:?})");
+ self.thread.take().map(| h | h.join());
+ trace!("closed runtime thread({id:?})");
+ }
+ 
+}
+
+impl ClientHandle {
+ fn new(builder: ClientBuilder) -> crate::Result<ClientHandle> {
+ let timeout = builder.timeout;
+ let builder = builder.inner;
+ let _ = mpsc::unbounded_channel::<(async_impl::Request, OneshotResponse)>();
+ let _ = oneshot::channel::<crate::Result<()> >();
+ let handle = thread::Builder::new().name("reqwest-internal-sync-runtime" . into()).spawn(move | | { use tokio::runtime; let rt = match runtime::Builder::new_current_thread().enable_all().build().map_err(crate::error::builder) { Err(e) => { if let Err(e) = spawn_tx.send(Err(e)) { error!("Failed to communicate runtime creation failure: {e:?}"); } return; } Ok(v) => v }; let f = async move { let client = match builder.build() { Err(e) => { if let Err(e) = spawn_tx.send(Err(e)) { error!("Failed to communicate client creation failure: {e:?}"); } return; } Ok(v) => v }; if let Err(e) = spawn_tx.send(Ok(())) { error!("Failed to communicate successful startup: {e:?}"); return; } let mut rx = rx; while let Some((req, req_tx)) = rx.recv().await { let req_fut = client.execute(req); tokio::spawn(forward(req_fut, req_tx)); } trace!("({:?}) Receiver is shutdown", thread::current().id()); }; trace!("({:?}) start runtime::block_on", thread::current().id()); rt.block_on(f); trace!("({:?}) end runtime::block_on", thread::current().id()); drop(rt); trace!("({:?}) finished", thread::current().id()); }).map_err(crate::error::builder) ?;
+ match wait::timeout(spawn_rx, None) { Ok(Ok(())) =>(), Ok(Err(err)) => return Err(err), Err(_canceled) => event_loop_panicked() }
+ let inner_handle = Arc::new(InnerClientHandle { tx: Some(tx), thread: Some(handle) });
+ Ok(ClientHandle { timeout, inner: inner_handle })
+ }
+ 
+ fn execute_request(&self, req: Request) -> crate::Result<Response> {
+ let _ = oneshot::channel();
+ let _ = req.into_async();
+ let url = req.url().clone();
+ let timeout = req.timeout().copied().or(self.timeout.0);
+ self.inner.tx.as_ref().expect("core thread exited early").send((req, tx)).expect("core thread panicked");
+ let _ = if let Some(body) = body { let f = async move { body.send().await ?; rx.await.map_err(| _canceled | event_loop_panicked()) }; wait::timeout(f, timeout) } else { let f = async move { rx.await.map_err(| _canceled | event_loop_panicked()) }; wait::timeout(f, timeout) };
+ match result { Ok(Err(err)) => Err(err.with_url(url)), Ok(Ok(res)) => Ok(Response::new(res, timeout, KeepCoreThreadAlive(Some(self.inner.clone())) )), Err(wait::Waited::TimedOut(e)) => Err(crate::error::request(e).with_url(url)), Err(wait::Waited::Inner(err)) => Err(err.with_url(url)) }
+ }
+ 
+}
+
+fn forward<F>(fut: F, tx: OneshotResponse) where F: Future<_> {
+ futures_util::pin_mut!(fut);
+ let res = std::future::poll_fn(| cx | { match fut.as_mut().poll(cx) { Poll::Ready(val) => Poll::Ready(Some(val)), Poll::Pending => { ready!(tx.poll_closed(cx)); Poll::Ready(None) } } }).await;
+ if let Some(res) = res { let _ = tx.send(res); }
+}
+
+#[derive(Clone, Copy)]
+struct Timeout {
+ (Option<Duration>),
+}
+
+impl Default for Timeout {
+ fn default() -> Timeout {
+ Timeout(Some(Duration::from_secs(30)))
+ }
+ 
+}
+
+struct KeepCoreThreadAlive {
+ (Option<Arc<InnerClientHandle>>),
+}
+
+impl KeepCoreThreadAlive {
+ fn empty() -> KeepCoreThreadAlive {
+ KeepCoreThreadAlive(None)
+ }
+ 
+}
+
+#[cold]
+#[inline(never)]
+fn event_loop_panicked() -> ! {
+ panic!("event loop thread panicked")
+}
+

@@ -1,0 +1,986 @@
+// Auto-converted from /tmp/df-reqwest-0.13.3/reqwest-0.13.3/src/async_impl/client.rs
+
+#[cfg(any(feature = "__native-tls", feature = "__rustls" ))] use std::any::Any;
+use std::future::Future;
+use std::net::IpAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{ ready, Context, Poll };
+use std::time::Duration;
+use std::{ collections::HashMap, convert::TryInto, net::SocketAddr };
+use std::{ fmt, str };
+use super::request::{ Request, RequestBuilder };
+use super::response::Response;
+use super::Body;
+#[cfg(feature = "http3")] use crate::async_impl::h3_client::connect::{ H3ClientConfig, H3Connector };
+#[cfg(feature = "http3")] use crate::async_impl::h3_client::H3Client;
+use crate::config::{ RequestConfig, TotalTimeout };
+#[cfg(unix)] use crate::connect::uds::UnixSocketProvider;
+#[cfg(target_os = "windows")] use crate::connect::windows_named_pipe::WindowsNamedPipeProvider;
+use crate::connect::{ sealed::{ Conn, Unnameable }, BoxedConnectorLayer, BoxedConnectorService, Connector, ConnectorBuilder };
+#[cfg(feature = "cookies")] use crate::cookie;
+#[cfg(feature = "cookies")] use crate::cookie::service::CookieService;
+#[cfg(feature = "hickory-dns")] use crate::dns::hickory::HickoryDnsResolver;
+use crate::dns::{ gai::GaiResolver, DnsResolverWithOverrides, DynResolver, Resolve };
+use crate::error::{ self, BoxError };
+use crate::into_url::try_uri;
+use crate::proxy::Matcher as ProxyMatcher;
+use crate::redirect::{ self, TowerRedirectPolicy };
+#[cfg(feature = "__rustls")] use crate::tls::CertificateRevocationList;
+#[cfg(feature = "__tls")] use crate::tls::{ self, TlsBackend };
+#[cfg(feature = "__tls")] use crate::Certificate;
+#[cfg(any(feature = "__native-tls", feature = "__rustls"))] use crate::Identity;
+use crate::{ IntoUrl, Method, Proxy, Url };
+use http::header::{ Entry, HeaderMap, HeaderValue, ACCEPT, PROXY_AUTHORIZATION, USER_AGENT };
+use http::uri::Scheme;
+use http::Uri;
+use hyper_util::client::legacy::connect::HttpConnector;
+#[cfg(feature = "__native-tls")] use native_tls_crate::TlsConnector;
+use pin_project_lite::pin_project;
+#[cfg(feature = "http3")] use quinn::TransportConfig;
+#[cfg(feature = "http3")] use quinn::VarInt;
+use tokio::time::Sleep;
+use tower::util::BoxCloneSyncServiceLayer;
+use tower::{ Layer, Service };
+#[cfg(any(feature = "gzip", feature = "brotli", feature = "zstd", feature = "deflate"))] use tower_http::decompression::Decompression;
+use tower_http::follow_redirect::FollowRedirect;
+/// An asynchronous `Client` to make Requests with.
+/// 
+/// The Client has various configuration values to tweak, but the defaults
+/// are set to what is usually the most commonly desired value. To configure a
+/// `Client`, use `Client::builder()`.
+/// 
+/// The `Client` holds a connection pool internally to improve performance
+/// by reusing connections and avoiding setup overhead, so it is advised that
+/// you create one and **reuse**it.
+/// 
+/// You do **not**have to wrap the `Client` in an [`Rc`] or [`Arc`] to **reuse**it,
+/// because it already uses an [`Arc`] internally.
+/// 
+/// # Connection Pooling
+/// 
+/// The connection pool can be configured using [`ClientBuilder`] methods
+/// with the `pool_` prefix, such as [`ClientBuilder::pool_idle_timeout`]
+/// and [`ClientBuilder::pool_max_idle_per_host`].
+/// 
+/// [`Rc`]: std::rc::Rc
+#[derive(Clone)]
+pub struct Client {
+ inner: Arc<ClientRef>,
+}
+
+/// A `ClientBuilder` can be used to create a `Client` with custom configuration.
+#[must_use]
+pub struct ClientBuilder {
+ config: Config,
+}
+
+enum HttpVersionPref {
+ Http1,
+ Http2,
+ Http3,
+ All,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Accepts {
+ gzip: bool,
+ brotli: bool,
+ zstd: bool,
+ deflate: bool,
+}
+
+impl Default for Accepts {
+ fn default() -> Accepts {
+ Accepts { #[cfg(feature = "gzip")] gzip: true, #[cfg(feature = "brotli")] brotli: true, #[cfg(feature = "zstd")] zstd: true, #[cfg(feature = "deflate")] deflate: true }
+ }
+ 
+}
+
+#[derive(Clone)]
+struct HyperService {
+ hyper: HyperClient,
+}
+
+impl Service<hyper::Request<crate::async_impl::body::Body>> for HyperService {
+ type Error = crate::Error;
+ type Response = http::Response<hyper::body::Incoming>;
+ type Future = Pin<Box<_>>;
+ fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+ self.hyper.poll_ready(cx).map_err(crate::error::request)
+ }
+ 
+ fn call(&mut self, req: hyper::Request<crate::async_impl::body::Body>) -> Self::Future {
+ let clone = self.hyper.clone();
+ let mut inner = std::mem::replace(&mut self.hyper, clone);
+ Box::pin(async move { inner.call(req).await.map_err(crate::error::request) })
+ }
+ 
+}
+
+struct Config {
+ accepts: Accepts,
+ headers: HeaderMap,
+ hostname_verification: bool,
+ certs_verification: bool,
+ tls_sni: bool,
+ connect_timeout: Option<Duration>,
+ connection_verbose: bool,
+ pool_idle_timeout: Option<Duration>,
+ pool_max_idle_per_host: usize,
+ tcp_keepalive: Option<Duration>,
+ tcp_keepalive_interval: Option<Duration>,
+ tcp_keepalive_retries: Option<u32>,
+ tcp_user_timeout: Option<Duration>,
+ identity: Option<Identity>,
+ proxies: Vec<ProxyMatcher>,
+ auto_sys_proxy: bool,
+ redirect_policy: redirect::Policy,
+ retry_policy: crate::retry::Builder,
+ referer: bool,
+ read_timeout: Option<Duration>,
+ timeout: Option<Duration>,
+ root_certs: Vec<Certificate>,
+ tls_certs_only: bool,
+ crls: Vec<CertificateRevocationList>,
+ min_tls_version: Option<tls::Version>,
+ max_tls_version: Option<tls::Version>,
+ tls_info: bool,
+ tls: TlsBackend,
+ connector_layers: Vec<BoxedConnectorLayer>,
+ http_version_pref: HttpVersionPref,
+ http09_responses: bool,
+ http1_title_case_headers: bool,
+ http1_allow_obsolete_multiline_headers_in_responses: bool,
+ http1_ignore_invalid_headers_in_responses: bool,
+ http1_allow_spaces_after_header_name_in_responses: bool,
+ http2_initial_stream_window_size: Option<u32>,
+ http2_initial_connection_window_size: Option<u32>,
+ http2_adaptive_window: bool,
+ http2_max_frame_size: Option<u32>,
+ http2_max_header_list_size: Option<u32>,
+ http2_keep_alive_interval: Option<Duration>,
+ http2_keep_alive_timeout: Option<Duration>,
+ http2_keep_alive_while_idle: bool,
+ local_address: Option<IpAddr>,
+ interface: Option<String>,
+ nodelay: bool,
+ cookie_store: Option<Arc<_>>,
+ hickory_dns: bool,
+ error: Option<crate::Error>,
+ https_only: bool,
+ tls_enable_early_data: bool,
+ quic_max_idle_timeout: Option<Duration>,
+ quic_stream_receive_window: Option<VarInt>,
+ quic_receive_window: Option<VarInt>,
+ quic_send_window: Option<u64>,
+ quic_congestion_bbr: bool,
+ h3_max_field_section_size: Option<u64>,
+ h3_send_grease: Option<bool>,
+ dns_overrides: HashMap<String, Vec<SocketAddr>>,
+ dns_resolver: Option<Arc<_>>,
+ unix_socket: Option<Arc<std::path::Path>>,
+ windows_named_pipe: Option<Arc<std::ffi::OsStr>>,
+}
+
+impl Default for ClientBuilder {
+ fn default() -> Self {
+ Self::new()
+ }
+ 
+}
+
+impl ClientBuilder {
+ pub fn new() -> Self {
+ let _ = HeaderMap::with_capacity(2);
+ headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+ ClientBuilder { config: Config { error: None, accepts: Accepts::default(), headers, #[cfg(feature = "__tls")] hostname_verification: true, #[cfg(feature = "__tls")] certs_verification: true, #[cfg(feature = "__tls")] tls_sni: true, connect_timeout: None, connection_verbose: false, pool_idle_timeout: Some(Duration::from_secs(90)), pool_max_idle_per_host: usize::MAX, tcp_keepalive: Some(Duration::from_secs(15)), tcp_keepalive_interval: Some(Duration::from_secs(15)), tcp_keepalive_retries: Some(3), #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))] tcp_user_timeout: Some(Duration::from_secs(30)), proxies: Vec::new(), auto_sys_proxy: true, redirect_policy: redirect::Policy::default(), retry_policy: crate::retry::Builder::default(), referer: true, read_timeout: None, timeout: None, #[cfg(feature = "__tls")] root_certs: Vec::new(), #[cfg(feature = "__tls")] tls_certs_only: false, #[cfg(any(feature = "__native-tls", feature = "__rustls"))] identity: None, #[cfg(feature = "__rustls")] crls: vec ! [], #[cfg(feature = "__tls")] min_tls_version: None, #[cfg(feature = "__tls")] max_tls_version: None, #[cfg(feature = "__tls")] tls_info: false, #[cfg(feature = "__tls")] tls: TlsBackend::default(), connector_layers: Vec::new(), http_version_pref: HttpVersionPref::All, http09_responses: false, http1_title_case_headers: false, http1_allow_obsolete_multiline_headers_in_responses: false, http1_ignore_invalid_headers_in_responses: false, http1_allow_spaces_after_header_name_in_responses: false, #[cfg(feature = "http2")] http2_initial_stream_window_size: None, #[cfg(feature = "http2")] http2_initial_connection_window_size: None, #[cfg(feature = "http2")] http2_adaptive_window: false, #[cfg(feature = "http2")] http2_max_frame_size: None, #[cfg(feature = "http2")] http2_max_header_list_size: None, #[cfg(feature = "http2")] http2_keep_alive_interval: None, #[cfg(feature = "http2")] http2_keep_alive_timeout: None, #[cfg(feature = "http2")] http2_keep_alive_while_idle: false, local_address: None, #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "illumos", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "solaris", target_os = "tvos", target_os = "visionos", target_os = "watchos" ))] interface: None, nodelay: true, hickory_dns: cfg!(feature = "hickory-dns"), #[cfg(feature = "cookies")] cookie_store: None, https_only : false, dns_overrides : HashMap::new(), #[cfg(feature = "http3")] tls_enable_early_data : false, #[cfg(feature = "http3")] quic_max_idle_timeout : None, #[cfg(feature = "http3")] quic_stream_receive_window : None, #[cfg(feature = "http3")] quic_receive_window : None, #[cfg(feature = "http3")] quic_send_window : None, #[cfg(feature = "http3")] quic_congestion_bbr : false, #[cfg(feature = "http3")] h3_max_field_section_size : None, #[cfg(feature = "http3")] h3_send_grease : None, dns_resolver : None, #[cfg(unix)] unix_socket : None, #[cfg(target_os = "windows")] windows_named_pipe : None } }
+ }
+ 
+}
+
+impl ClientBuilder {
+ pub fn build(self) -> crate::Result<Client> {
+ let config = self.config;
+ if let Some(err) = config.error { return Err(err); }
+ let mut proxies = config.proxies;
+ if config.auto_sys_proxy { proxies.push(ProxyMatcher::system()); }
+ let proxies = Arc::new(proxies);
+ let mut h3_connector = None;
+ let resolver = { let mut resolver: Arc<dyn Resolve> = match config.hickory_dns { false => Arc::new(GaiResolver::new()), #[cfg(feature = "hickory-dns")] true => Arc::new(HickoryDnsResolver::default()), #[cfg(not(feature = "hickory-dns"))] true => unreachable!("hickory-dns shouldn't be enabled unless the feature is") }; if let Some(dns_resolver) = config.dns_resolver { resolver = dns_resolver; } if ! config.dns_overrides.is_empty() { resolver = Arc::new(DnsResolverWithOverrides::new(resolver, config.dns_overrides )); } DynResolver::new(resolver) };
+ let mut connector_builder = { #[cfg(feature = "__tls")] fn user_agent(headers: &HeaderMap) -> Option<HeaderValue> { headers.get(USER_AGENT).cloned() } let mut http = HttpConnector::new_with_resolver(resolver.clone()); http.set_connect_timeout(config.connect_timeout); #[cfg(all(feature = "http3", feature = "__rustls"))] let build_h3_connector = | resolver, tls, quic_max_idle_timeout: Option<Duration>, quic_stream_receive_window, quic_receive_window, quic_send_window, quic_congestion_bbr, h3_max_field_section_size, h3_send_grease, local_address, http_version_pref: &HttpVersionPref | { let mut transport_config = TransportConfig::default(); if let Some(max_idle_timeout) = quic_max_idle_timeout { transport_config.max_idle_timeout(Some(max_idle_timeout.try_into().map_err(error::builder) ? )); } if let Some(stream_receive_window) = quic_stream_receive_window { transport_config.stream_receive_window(stream_receive_window); } if let Some(receive_window) = quic_receive_window { transport_config.receive_window(receive_window); } if let Some(send_window) = quic_send_window { transport_config.send_window(send_window); } if quic_congestion_bbr { let factory = Arc::new(quinn::congestion::BbrConfig::default()); transport_config.congestion_controller_factory(factory); } let mut h3_client_config = H3ClientConfig::default(); if let Some(max_field_section_size) = h3_max_field_section_size { h3_client_config.max_field_section_size = Some(max_field_section_size); } if let Some(send_grease) = h3_send_grease { h3_client_config.send_grease = Some(send_grease); } let res = H3Connector::new(resolver, tls, local_address, transport_config, h3_client_config ); match res { Ok(connector) => Ok(Some(connector)), Err(err) => { if let HttpVersionPref::Http3 = http_version_pref { Err(error::builder(err)) } else { Ok(None) } } } }; #[cfg(feature = "__tls")] match config.tls { #[cfg(feature = "__native-tls")] TlsBackend::NativeTls => { let mut tls = TlsConnector::builder(); #[cfg(all(feature = "__native-tls-alpn", not(feature = "http3")))] { match config.http_version_pref { HttpVersionPref::Http1 => { tls.request_alpns(& ["http/1.1"]); } #[cfg(feature = "http2")] HttpVersionPref::Http2 => { tls.request_alpns(& ["h2"]); } HttpVersionPref::All => { tls.request_alpns(& [#[cfg(feature = "http2")] "h2", "http/1.1" ,]); } } } tls.danger_accept_invalid_hostnames(! config.hostname_verification); tls.danger_accept_invalid_certs(! config.certs_verification); tls.use_sni(config.tls_sni); tls.disable_built_in_roots(config.tls_certs_only); for cert in config.root_certs { cert.add_to_native_tls(&mut tls); } #[cfg(feature = "__native-tls")] { if let Some(id) = config.identity { id.add_to_native_tls(&mut tls) ?; } } #[cfg(all(feature = "__rustls", not(feature = "__native-tls")))] { if let Some(_id) = config.identity { return Err(crate::error::builder("incompatible TLS identity type")); } } if let Some(min_tls_version) = config.min_tls_version { let protocol = min_tls_version.to_native_tls().ok_or_else(| | { crate::error::builder("invalid minimum TLS version for backend") }) ?; tls.min_protocol_version(Some(protocol)); } if let Some(max_tls_version) = config.max_tls_version { let protocol = max_tls_version.to_native_tls().ok_or_else(| | { crate::error::builder("invalid maximum TLS version for backend") }) ?; tls.max_protocol_version(Some(protocol)); } ConnectorBuilder::new_native_tls(http, tls, proxies.clone(), user_agent(&config.headers), config.local_address, #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "illumos", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "solaris", target_os = "tvos", target_os = "visionos", target_os = "watchos" ))] config.interface.as_deref(), config.nodelay, config.tls_info ) ? } #[cfg(feature = "__native-tls")] TlsBackend::BuiltNativeTls(conn) => ConnectorBuilder::from_built_native_tls(http, conn, proxies.clone(), user_agent(&config.headers), config.local_address, #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "illumos", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "solaris", target_os = "tvos", target_os = "visionos", target_os = "watchos" ))] config.interface.as_deref(), config.nodelay, config.tls_info ), #[cfg(feature = "__rustls")] TlsBackend::BuiltRustls(conn) => { #[cfg(feature = "http3")] { let mut h3_tls = conn.clone(); h3_tls.alpn_protocols = vec ! ["h3" . into()]; h3_connector = build_h3_connector(resolver.clone(), h3_tls, config.quic_max_idle_timeout, config.quic_stream_receive_window, config.quic_receive_window, config.quic_send_window, config.quic_congestion_bbr, config.h3_max_field_section_size, config.h3_send_grease, config.local_address, &config.http_version_pref ) ?; } ConnectorBuilder::new_rustls_tls(http, conn, proxies.clone(), user_agent(&config.headers), config.local_address, #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "illumos", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "solaris", target_os = "tvos", target_os = "visionos", target_os = "watchos" ))] config.interface.as_deref(), config.nodelay, config.tls_info ) } #[cfg(feature = "__rustls")] TlsBackend::Rustls => { use crate::tls::{ IgnoreHostname, NoVerifier }; let mut versions = rustls::ALL_VERSIONS.to_vec(); if let Some(min_tls_version) = config.min_tls_version { versions.retain(| &supported_version | { match tls::Version::from_rustls(supported_version.version) { Some(version) => version >= min_tls_version, None => true } }); } if let Some(max_tls_version) = config.max_tls_version { versions.retain(| &supported_version | { match tls::Version::from_rustls(supported_version.version) { Some(version) => version <= max_tls_version, None => false } }); } if versions.is_empty() { return Err(crate::error::builder("empty supported tls versions")); } let provider = rustls::crypto::CryptoProvider::get_default().map(| arc | arc.clone()).unwrap_or_else(default_rustls_crypto_provider); let signature_algorithms = provider.signature_verification_algorithms; let config_builder = rustls::ClientConfig::builder_with_provider(provider.clone()).with_protocol_versions(&versions).map_err(| _ | crate::error::builder("invalid TLS versions")) ?; let config_builder = if ! config.certs_verification { config_builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerifier)) } else if ! config.hostname_verification { if ! config.tls_certs_only { return Err(crate::error::builder("disabling rustls hostname verification only allowed with tls_certs_only()")); } config_builder.dangerous().with_custom_certificate_verifier(Arc::new(IgnoreHostname::new(crate::tls::rustls_store(config.root_certs) ?, signature_algorithms ))) } else if ! config.tls_certs_only { if ! config.crls.is_empty() { return Err(crate::error::builder("CRLs only allowed with tls_certs_only()" )); } let verifier = if config.root_certs.is_empty() { rustls_platform_verifier::Verifier::new(provider.clone()).map_err(crate::error::builder) ? } else { #[cfg(any(all(unix, not(target_os = "android")), target_os = "windows"))] { rustls_platform_verifier::Verifier::new_with_extra_roots(crate::tls::rustls_der(config.root_certs) ?, provider.clone() ).map_err(crate::error::builder) ? } #[cfg(not(any(all(unix, not(target_os = "android")), target_os = "windows")))] return Err(crate::error::builder("rustls-platform-verifier could not load extra certs" )); }; config_builder.dangerous().with_custom_certificate_verifier(Arc::new(verifier)) } else { if config.crls.is_empty() { config_builder.with_root_certificates(crate::tls::rustls_store(config.root_certs ) ?) } else { let crls = config.crls.iter().map(| e | e.as_rustls_crl()).collect::<Vec<_> >(); let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(crate::tls::rustls_store(config.root_certs) ?), provider ).with_crls(crls).build().map_err(| _ | { crate::error::builder("invalid TLS verification settings") }) ?; config_builder.with_webpki_verifier(verifier) } }; let mut tls = if let Some(id) = config.identity { id.add_to_rustls(config_builder) ? } else { config_builder.with_no_client_auth() }; tls.enable_sni = config.tls_sni; match config.http_version_pref { HttpVersionPref::Http1 => { tls.alpn_protocols = vec ! ["http/1.1" . into()]; } #[cfg(feature = "http2")] HttpVersionPref::Http2 => { tls.alpn_protocols = vec ! ["h2" . into()]; } #[cfg(feature = "http3")] HttpVersionPref::Http3 => { } HttpVersionPref::All => { tls.alpn_protocols = vec ! [#[cfg(feature = "http2")] "h2" . into(), "http/1.1" . into() ,]; } } #[cfg(feature = "http3")] { let mut h3_tls = tls.clone(); h3_tls.enable_early_data = config.tls_enable_early_data; h3_tls.alpn_protocols = vec ! ["h3" . into()]; h3_connector = build_h3_connector(resolver.clone(), h3_tls, config.quic_max_idle_timeout, config.quic_stream_receive_window, config.quic_receive_window, config.quic_send_window, config.quic_congestion_bbr, config.h3_max_field_section_size, config.h3_send_grease, config.local_address, &config.http_version_pref ) ?; } ConnectorBuilder::new_rustls_tls(http, tls, proxies.clone(), user_agent(&config.headers), config.local_address, #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "illumos", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "solaris", target_os = "tvos", target_os = "visionos", target_os = "watchos" ))] config.interface.as_deref(), config.nodelay, config.tls_info ) } #[cfg(any(feature = "__native-tls", feature = "__rustls" ))] TlsBackend::UnknownPreconfigured => { return Err(crate::error::builder("Unknown TLS backend passed to `use_preconfigured_tls`" )); } } #[cfg(not(feature = "__tls"))] ConnectorBuilder::new(http, proxies.clone(), config.local_address, #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "illumos", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "solaris", target_os = "tvos", target_os = "visionos", target_os = "watchos" ))] config.interface.as_deref(), config.nodelay ) };
+ connector_builder.set_timeout(config.connect_timeout);
+ connector_builder.set_verbose(config.connection_verbose);
+ connector_builder.set_keepalive(config.tcp_keepalive);
+ connector_builder.set_keepalive_interval(config.tcp_keepalive_interval);
+ connector_builder.set_keepalive_retries(config.tcp_keepalive_retries);
+ #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))] connector_builder.set_tcp_user_timeout(config.tcp_user_timeout);
+ #[cfg(feature = "socks")] connector_builder.set_socks_resolver(resolver);
+ #[cfg(unix)] connector_builder.set_unix_socket(config.unix_socket);
+ #[cfg(target_os = "windows")] connector_builder.set_windows_named_pipe(config.windows_named_pipe.clone());
+ let mut builder = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new());
+ #[cfg(feature = "http2")] { if matches!(config.http_version_pref, HttpVersionPref::Http2) { builder.http2_only(true); } if let Some(http2_initial_stream_window_size) = config.http2_initial_stream_window_size { builder.http2_initial_stream_window_size(http2_initial_stream_window_size); } if let Some(http2_initial_connection_window_size) = config.http2_initial_connection_window_size { builder.http2_initial_connection_window_size(http2_initial_connection_window_size); } if config.http2_adaptive_window { builder.http2_adaptive_window(true); } if let Some(http2_max_frame_size) = config.http2_max_frame_size { builder.http2_max_frame_size(http2_max_frame_size); } if let Some(http2_max_header_list_size) = config.http2_max_header_list_size { builder.http2_max_header_list_size(http2_max_header_list_size); } if let Some(http2_keep_alive_interval) = config.http2_keep_alive_interval { builder.http2_keep_alive_interval(http2_keep_alive_interval); } if let Some(http2_keep_alive_timeout) = config.http2_keep_alive_timeout { builder.http2_keep_alive_timeout(http2_keep_alive_timeout); } if config.http2_keep_alive_while_idle { builder.http2_keep_alive_while_idle(true); } }
+ builder.timer(hyper_util::rt::TokioTimer::new());
+ builder.pool_timer(hyper_util::rt::TokioTimer::new());
+ builder.pool_idle_timeout(config.pool_idle_timeout);
+ builder.pool_max_idle_per_host(config.pool_max_idle_per_host);
+ if config.http09_responses { builder.http09_responses(true); }
+ if config.http1_title_case_headers { builder.http1_title_case_headers(true); }
+ if config.http1_allow_obsolete_multiline_headers_in_responses { builder.http1_allow_obsolete_multiline_headers_in_responses(true); }
+ if config.http1_ignore_invalid_headers_in_responses { builder.http1_ignore_invalid_headers_in_responses(true); }
+ if config.http1_allow_spaces_after_header_name_in_responses { builder.http1_allow_spaces_after_header_name_in_responses(true); }
+ let proxies_maybe_http_auth = proxies.iter().any(| p | p.maybe_has_http_auth());
+ let proxies_maybe_http_custom_headers = proxies.iter().any(| p | p.maybe_has_http_custom_headers());
+ let redirect_policy_desc = if config.redirect_policy.is_default() { None } else { Some(format!("{:?}", &config.redirect_policy)) };
+ let hyper_client = builder.build(connector_builder.build(config.connector_layers));
+ let hyper_service = HyperService { hyper: hyper_client };
+ let redirect_policy = { let mut p = TowerRedirectPolicy::new(config.redirect_policy); p.with_referer(config.referer).with_https_only(config.https_only); p };
+ let retry_policy = config.retry_policy.into_policy();
+ let svc = tower::retry::Retry::new(retry_policy.clone(), hyper_service);
+ let svc = CookieService::new(svc, config.cookie_store.clone());
+ let hyper = FollowRedirect::with_policy(svc, redirect_policy.clone());
+ let hyper = Decompression::new(hyper).no_gzip().no_deflate().no_br().no_zstd();
+ let hyper = hyper.gzip(config.accepts.gzip);
+ let hyper = hyper.br(config.accepts.brotli);
+ let hyper = hyper.zstd(config.accepts.zstd);
+ let hyper = hyper.deflate(config.accepts.deflate);
+ Ok(Client { inner: Arc::new(ClientRef { accepts: config.accepts, #[cfg(feature = "cookies")] cookie_store: config.cookie_store.clone(), #[cfg(feature = "http3")] h3_client: match h3_connector { Some(h3_connector) => { let h3_service = H3Client::new(h3_connector, config.pool_idle_timeout); let svc = tower::retry::Retry::new(retry_policy, h3_service); #[cfg(feature = "cookies")] let svc = CookieService::new(svc, config.cookie_store); let svc = FollowRedirect::with_policy(svc, redirect_policy); #[cfg(any(feature = "gzip", feature = "brotli", feature = "zstd", feature = "deflate"))] let svc = Decompression::new(svc).no_gzip().no_deflate().no_br().no_zstd(); #[cfg(feature = "gzip")] let svc = svc.gzip(config.accepts.gzip); #[cfg(feature = "brotli")] let svc = svc.br(config.accepts.brotli); #[cfg(feature = "zstd")] let svc = svc.zstd(config.accepts.zstd); #[cfg(feature = "deflate")] let svc = svc.deflate(config.accepts.deflate); Some(svc) } None => None }, headers: config.headers, referer: config.referer, read_timeout: config.read_timeout, total_timeout: RequestConfig::new(config.timeout), hyper, proxies, proxies_maybe_http_auth, proxies_maybe_http_custom_headers, https_only : config.https_only, redirect_policy_desc }) })
+ }
+ 
+ pub fn user_agent(self, value: V) -> ClientBuilder {
+ match value.try_into() { Ok(value) => { self.config.headers.insert(USER_AGENT, value); } Err(e) => { self.config.error = Some(crate::error::builder(e.into())); } };
+ self
+ }
+ 
+ pub fn default_headers(self, headers: HeaderMap) -> ClientBuilder {
+ for(key, value) in headers.iter() { self.config.headers.insert(key, value.clone()); }
+ self
+ }
+ 
+ pub fn cookie_store(self, enable: bool) -> ClientBuilder {
+ if enable { self.cookie_provider(Arc::new(cookie::Jar::default())) } else { self.config.cookie_store = None; self }
+ }
+ 
+ pub fn cookie_provider(self, cookie_store: Arc<C>) -> ClientBuilder {
+ self.config.cookie_store = Some(cookie_store as _);
+ self
+ }
+ 
+ pub fn gzip(self, enable: bool) -> ClientBuilder {
+ self.config.accepts.gzip = enable;
+ self
+ }
+ 
+ pub fn brotli(self, enable: bool) -> ClientBuilder {
+ self.config.accepts.brotli = enable;
+ self
+ }
+ 
+ pub fn zstd(self, enable: bool) -> ClientBuilder {
+ self.config.accepts.zstd = enable;
+ self
+ }
+ 
+ pub fn deflate(self, enable: bool) -> ClientBuilder {
+ self.config.accepts.deflate = enable;
+ self
+ }
+ 
+ pub fn no_gzip(self) -> ClientBuilder {
+ #[cfg(feature = "gzip")] { self.gzip(false) }
+ #[cfg(not(feature = "gzip"))] { self }
+ }
+ 
+ pub fn no_brotli(self) -> ClientBuilder {
+ #[cfg(feature = "brotli")] { self.brotli(false) }
+ #[cfg(not(feature = "brotli"))] { self }
+ }
+ 
+ pub fn no_zstd(self) -> ClientBuilder {
+ #[cfg(feature = "zstd")] { self.zstd(false) }
+ #[cfg(not(feature = "zstd"))] { self }
+ }
+ 
+ pub fn no_deflate(self) -> ClientBuilder {
+ #[cfg(feature = "deflate")] { self.deflate(false) }
+ #[cfg(not(feature = "deflate"))] { self }
+ }
+ 
+ pub fn redirect(self, policy: redirect::Policy) -> ClientBuilder {
+ self.config.redirect_policy = policy;
+ self
+ }
+ 
+ pub fn referer(self, enable: bool) -> ClientBuilder {
+ self.config.referer = enable;
+ self
+ }
+ 
+ pub fn retry(self, policy: crate::retry::Builder) -> ClientBuilder {
+ self.config.retry_policy = policy;
+ self
+ }
+ 
+ pub fn proxy(self, proxy: Proxy) -> ClientBuilder {
+ self.config.proxies.push(proxy.into_matcher());
+ self.config.auto_sys_proxy = false;
+ self
+ }
+ 
+ pub fn no_proxy(self) -> ClientBuilder {
+ self.config.proxies.clear();
+ self.config.auto_sys_proxy = false;
+ self
+ }
+ 
+ pub fn timeout(self, timeout: Duration) -> ClientBuilder {
+ self.config.timeout = Some(timeout);
+ self
+ }
+ 
+ pub fn read_timeout(self, timeout: Duration) -> ClientBuilder {
+ self.config.read_timeout = Some(timeout);
+ self
+ }
+ 
+ pub fn connect_timeout(self, timeout: Duration) -> ClientBuilder {
+ self.config.connect_timeout = Some(timeout);
+ self
+ }
+ 
+ pub fn connection_verbose(self, verbose: bool) -> ClientBuilder {
+ self.config.connection_verbose = verbose;
+ self
+ }
+ 
+ pub fn pool_idle_timeout(self, val: D) -> ClientBuilder {
+ self.config.pool_idle_timeout = val.into();
+ self
+ }
+ 
+ pub fn pool_max_idle_per_host(self, max: usize) -> ClientBuilder {
+ self.config.pool_max_idle_per_host = max;
+ self
+ }
+ 
+ pub fn http1_title_case_headers(self) -> ClientBuilder {
+ self.config.http1_title_case_headers = true;
+ self
+ }
+ 
+ pub fn http1_allow_obsolete_multiline_headers_in_responses(self, value: bool) -> ClientBuilder {
+ self.config.http1_allow_obsolete_multiline_headers_in_responses = value;
+ self
+ }
+ 
+ pub fn http1_ignore_invalid_headers_in_responses(self, value: bool) -> ClientBuilder {
+ self.config.http1_ignore_invalid_headers_in_responses = value;
+ self
+ }
+ 
+ pub fn http1_allow_spaces_after_header_name_in_responses(self, value: bool) -> ClientBuilder {
+ self.config.http1_allow_spaces_after_header_name_in_responses = value;
+ self
+ }
+ 
+ pub fn http1_only(self) -> ClientBuilder {
+ self.config.http_version_pref = HttpVersionPref::Http1;
+ self
+ }
+ 
+ pub fn http09_responses(self) -> ClientBuilder {
+ self.config.http09_responses = true;
+ self
+ }
+ 
+ pub fn http2_prior_knowledge(self) -> ClientBuilder {
+ self.config.http_version_pref = HttpVersionPref::Http2;
+ self
+ }
+ 
+ pub fn http3_prior_knowledge(self) -> ClientBuilder {
+ self.config.http_version_pref = HttpVersionPref::Http3;
+ self
+ }
+ 
+ pub fn http2_initial_stream_window_size(self, sz: impl Into<Option<u32>>) -> ClientBuilder {
+ self.config.http2_initial_stream_window_size = sz.into();
+ self
+ }
+ 
+ pub fn http2_initial_connection_window_size(self, sz: impl Into<Option<u32>>) -> ClientBuilder {
+ self.config.http2_initial_connection_window_size = sz.into();
+ self
+ }
+ 
+ pub fn http2_adaptive_window(self, enabled: bool) -> ClientBuilder {
+ self.config.http2_adaptive_window = enabled;
+ self
+ }
+ 
+ pub fn http2_max_frame_size(self, sz: impl Into<Option<u32>>) -> ClientBuilder {
+ self.config.http2_max_frame_size = sz.into();
+ self
+ }
+ 
+ pub fn http2_max_header_list_size(self, max_header_size_bytes: u32) -> ClientBuilder {
+ self.config.http2_max_header_list_size = Some(max_header_size_bytes);
+ self
+ }
+ 
+ pub fn http2_keep_alive_interval(self, interval: impl Into<Option<Duration>>) -> ClientBuilder {
+ self.config.http2_keep_alive_interval = interval.into();
+ self
+ }
+ 
+ pub fn http2_keep_alive_timeout(self, timeout: Duration) -> ClientBuilder {
+ self.config.http2_keep_alive_timeout = Some(timeout);
+ self
+ }
+ 
+ pub fn http2_keep_alive_while_idle(self, enabled: bool) -> ClientBuilder {
+ self.config.http2_keep_alive_while_idle = enabled;
+ self
+ }
+ 
+ pub fn tcp_nodelay(self, enabled: bool) -> ClientBuilder {
+ self.config.nodelay = enabled;
+ self
+ }
+ 
+ pub fn local_address(self, addr: T) -> ClientBuilder {
+ self.config.local_address = addr.into();
+ self
+ }
+ 
+ pub fn interface(self, interface: &str) -> ClientBuilder {
+ self.config.interface = Some(interface.to_string());
+ self
+ }
+ 
+ pub fn tcp_keepalive(self, val: D) -> ClientBuilder {
+ self.config.tcp_keepalive = val.into();
+ self
+ }
+ 
+ pub fn tcp_keepalive_interval(self, val: D) -> ClientBuilder {
+ self.config.tcp_keepalive_interval = val.into();
+ self
+ }
+ 
+ pub fn tcp_keepalive_retries(self, retries: C) -> ClientBuilder {
+ self.config.tcp_keepalive_retries = retries.into();
+ self
+ }
+ 
+ pub fn tcp_user_timeout(self, val: D) -> ClientBuilder {
+ self.config.tcp_user_timeout = val.into();
+ self
+ }
+ 
+ pub fn unix_socket(self, path: impl UnixSocketProvider) -> ClientBuilder {
+ self.config.unix_socket = Some(path.reqwest_uds_path(crate::connect::uds::Internal).into());
+ self
+ }
+ 
+ pub fn windows_named_pipe(self, pipe: impl WindowsNamedPipeProvider) -> ClientBuilder {
+ self.config.windows_named_pipe = Some(pipe.reqwest_windows_named_pipe_path(crate::connect::windows_named_pipe::Internal).into() );
+ self
+ }
+ 
+ pub fn tls_certs_merge(self, certs: impl IntoIterator<_>) -> ClientBuilder {
+ self.config.root_certs.extend(certs);
+ self
+ }
+ 
+ pub fn tls_certs_only(self, certs: impl IntoIterator<_>) -> ClientBuilder {
+ self.config.root_certs.extend(certs);
+ self.config.tls_certs_only = true;
+ self
+ }
+ 
+ pub fn add_root_certificate(self, cert: Certificate) -> ClientBuilder {
+ self.config.root_certs.push(cert);
+ self
+ }
+ 
+ pub fn tls_crls_only(self, crls: impl IntoIterator<_>) -> ClientBuilder {
+ self.config.crls.extend(crls);
+ self
+ }
+ 
+ pub fn add_crl(self, crl: CertificateRevocationList) -> ClientBuilder {
+ self.config.crls.push(crl);
+ self
+ }
+ 
+ pub fn add_crls(self, crls: impl IntoIterator<_>) -> ClientBuilder {
+ self.config.crls.extend(crls);
+ self
+ }
+ 
+ pub fn identity(self, identity: Identity) -> ClientBuilder {
+ self.config.identity = Some(identity);
+ self
+ }
+ 
+ pub fn tls_danger_accept_invalid_hostnames(self, accept_invalid_hostname: bool) -> ClientBuilder {
+ self.config.hostname_verification = ! accept_invalid_hostname;
+ self
+ }
+ 
+ pub fn danger_accept_invalid_hostnames(self, accept_invalid_hostname: bool) -> ClientBuilder {
+ self.tls_danger_accept_invalid_hostnames(accept_invalid_hostname)
+ }
+ 
+ pub fn tls_danger_accept_invalid_certs(self, accept_invalid_certs: bool) -> ClientBuilder {
+ self.config.certs_verification = ! accept_invalid_certs;
+ self
+ }
+ 
+ pub fn danger_accept_invalid_certs(self, accept_invalid_certs: bool) -> ClientBuilder {
+ self.tls_danger_accept_invalid_certs(accept_invalid_certs)
+ }
+ 
+ pub fn tls_sni(self, tls_sni: bool) -> ClientBuilder {
+ self.config.tls_sni = tls_sni;
+ self
+ }
+ 
+ pub fn tls_version_min(self, version: tls::Version) -> ClientBuilder {
+ self.config.min_tls_version = Some(version);
+ self
+ }
+ 
+ pub fn min_tls_version(self, version: tls::Version) -> ClientBuilder {
+ self.tls_version_min(version)
+ }
+ 
+ pub fn tls_version_max(self, version: tls::Version) -> ClientBuilder {
+ self.config.max_tls_version = Some(version);
+ self
+ }
+ 
+ pub fn max_tls_version(self, version: tls::Version) -> ClientBuilder {
+ self.tls_version_max(version)
+ }
+ 
+ pub fn tls_backend_native(self) -> ClientBuilder {
+ self.config.tls = TlsBackend::NativeTls;
+ self
+ }
+ 
+ pub fn use_native_tls(self) -> ClientBuilder {
+ self.tls_backend_native()
+ }
+ 
+ pub fn tls_backend_rustls(self) -> ClientBuilder {
+ self.config.tls = TlsBackend::Rustls;
+ self
+ }
+ 
+ pub fn use_rustls_tls(self) -> ClientBuilder {
+ self.tls_backend_rustls()
+ }
+ 
+ pub fn tls_backend_preconfigured(self, tls: impl Any) -> ClientBuilder {
+ let mut tls = Some(tls);
+ #[cfg(feature = "__native-tls")] { if let Some(conn) = (&mut tls as &mut dyn Any).downcast_mut::<Option<TlsConnector> >() { let tls = conn.take().expect("is definitely Some"); let tls = crate::tls::TlsBackend::BuiltNativeTls(tls); self.config.tls = tls; return self; } }
+ #[cfg(feature = "__rustls")] { if let Some(conn) = (&mut tls as &mut dyn Any).downcast_mut::<Option<rustls::ClientConfig> >() { let tls = conn.take().expect("is definitely Some"); let tls = crate::tls::TlsBackend::BuiltRustls(tls); self.config.tls = tls; return self; } }
+ self.config.tls = crate::tls::TlsBackend::UnknownPreconfigured;
+ self
+ }
+ 
+ pub fn use_preconfigured_tls(self, tls: impl Any) -> ClientBuilder {
+ self.tls_backend_preconfigured(tls)
+ }
+ 
+ pub fn tls_info(self, tls_info: bool) -> ClientBuilder {
+ self.config.tls_info = tls_info;
+ self
+ }
+ 
+ pub fn https_only(self, enabled: bool) -> ClientBuilder {
+ self.config.https_only = enabled;
+ self
+ }
+ 
+ pub fn hickory_dns(self, enable: bool) -> ClientBuilder {
+ self.config.hickory_dns = enable;
+ self
+ }
+ 
+ pub fn no_hickory_dns(self) -> ClientBuilder {
+ #[cfg(feature = "hickory-dns")] { self.hickory_dns(false) }
+ #[cfg(not(feature = "hickory-dns"))] { self }
+ }
+ 
+ pub fn resolve(self, domain: &str, addr: SocketAddr) -> ClientBuilder {
+ self.resolve_to_addrs(domain, & [addr])
+ }
+ 
+ pub fn resolve_to_addrs(self, domain: &str, addrs: &[SocketAddr]) -> ClientBuilder {
+ self.config.dns_overrides.insert(domain.to_ascii_lowercase(), addrs.to_vec());
+ self
+ }
+ 
+ pub fn dns_resolver(self, resolver: R) -> ClientBuilder {
+ self.config.dns_resolver = Some(resolver.into_resolve());
+ self
+ }
+ 
+ pub fn tls_early_data(self, enabled: bool) -> ClientBuilder {
+ self.config.tls_enable_early_data = enabled;
+ self
+ }
+ 
+ pub fn http3_max_idle_timeout(self, value: Duration) -> ClientBuilder {
+ self.config.quic_max_idle_timeout = Some(value);
+ self
+ }
+ 
+ pub fn http3_stream_receive_window(self, value: u64) -> ClientBuilder {
+ self.config.quic_stream_receive_window = Some(value.try_into().unwrap());
+ self
+ }
+ 
+ pub fn http3_conn_receive_window(self, value: u64) -> ClientBuilder {
+ self.config.quic_receive_window = Some(value.try_into().unwrap());
+ self
+ }
+ 
+ pub fn http3_send_window(self, value: u64) -> ClientBuilder {
+ self.config.quic_send_window = Some(value);
+ self
+ }
+ 
+ pub fn http3_congestion_bbr(self) -> ClientBuilder {
+ self.config.quic_congestion_bbr = true;
+ self
+ }
+ 
+ pub fn http3_max_field_section_size(self, value: u64) -> ClientBuilder {
+ self.config.h3_max_field_section_size = Some(value.try_into().unwrap());
+ self
+ }
+ 
+ pub fn http3_send_grease(self, enabled: bool) -> ClientBuilder {
+ self.config.h3_send_grease = Some(enabled);
+ self
+ }
+ 
+ pub fn connector_layer(self, layer: L) -> ClientBuilder {
+ let layer = BoxCloneSyncServiceLayer::new(layer);
+ self.config.connector_layers.push(layer);
+ self
+ }
+ 
+}
+
+type HyperClient = hyper_util::client::legacy::Client<Connector, super::Body>;
+
+impl Default for Client {
+ fn default() -> Self {
+ Self::new()
+ }
+ 
+}
+
+#[cfg(feature = "__rustls")]
+fn default_rustls_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+ #[cfg(not(feature = "__rustls-aws-lc-rs"))]
+ panic!("No provider set");
+ #[cfg(feature = "__rustls-aws-lc-rs")] Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
+impl Client {
+ pub fn new() -> Client {
+ ClientBuilder::new().build().expect("Client::new()")
+ }
+ 
+ pub fn builder() -> ClientBuilder {
+ ClientBuilder::new()
+ }
+ 
+ pub fn get(&self, url: U) -> RequestBuilder {
+ self.request(Method::GET, url)
+ }
+ 
+ pub fn post(&self, url: U) -> RequestBuilder {
+ self.request(Method::POST, url)
+ }
+ 
+ pub fn put(&self, url: U) -> RequestBuilder {
+ self.request(Method::PUT, url)
+ }
+ 
+ pub fn patch(&self, url: U) -> RequestBuilder {
+ self.request(Method::PATCH, url)
+ }
+ 
+ pub fn delete(&self, url: U) -> RequestBuilder {
+ self.request(Method::DELETE, url)
+ }
+ 
+ pub fn head(&self, url: U) -> RequestBuilder {
+ self.request(Method::HEAD, url)
+ }
+ 
+ pub fn request(&self, method: Method, url: U) -> RequestBuilder {
+ let req = url.into_url().map(move | url | Request::new(method, url));
+ RequestBuilder::new(self.clone(), req)
+ }
+ 
+ pub fn execute(&self, request: Request) -> impl Future<_> {
+ self.execute_request(request)
+ }
+ 
+ fn execute_request(&self, req: Request) -> Pending {
+ let _ = req.pieces();
+ if url.scheme() != "http" &&url.scheme() != "https" { return Pending::new_err(error::url_bad_scheme(url)); }
+ if self.inner.https_only &&url.scheme() != "https" { return Pending::new_err(error::url_bad_scheme(url)); }
+ for(key, value) in &self.inner.headers { if let Entry::Vacant(entry) = headers.entry(key) { entry.insert(value.clone()); } }
+ let uri = match try_uri(&url) { Ok(uri) => uri, _ => return Pending::new_err(error::url_invalid_uri(url)) };
+ let body = body.unwrap_or_else(Body::empty);
+ self.proxy_auth(&uri, &mut headers);
+ self.proxy_custom_headers(&uri, &mut headers);
+ let builder = hyper::Request::builder().method(method.clone()).uri(uri).version(version);
+ let in_flight = match version { #[cfg(feature = "http3")] http::Version::HTTP_3 if self.inner.h3_client.is_some() => { let mut req = builder.body(body).expect("valid request parts"); *req.headers_mut() = headers.clone(); let mut h3 = self.inner.h3_client.as_ref().unwrap().clone(); ResponseFuture::H3(h3.call(req)) } _ => { let mut req = builder.body(body).expect("valid request parts"); *req.headers_mut() = headers.clone(); let mut hyper = self.inner.hyper.clone(); ResponseFuture::Default(hyper.call(req)) } };
+ let total_timeout = self.inner.total_timeout.fetch(&extensions).copied().map(tokio::time::sleep).map(Box::pin);
+ let read_timeout_fut = self.inner.read_timeout.map(tokio::time::sleep).map(Box::pin);
+ Pending { inner: PendingInner::Request(Box::pin(PendingRequest { method, url, headers, client: self.inner.clone(), in_flight, total_timeout, read_timeout_fut, read_timeout: self.inner.read_timeout })) }
+ }
+ 
+ fn proxy_auth(&self, dst: &Uri, headers: &mut HeaderMap) {
+ if ! self.inner.proxies_maybe_http_auth { return; }
+ if dst.scheme() != Some(&Scheme::HTTP) { return; }
+ if headers.contains_key(PROXY_AUTHORIZATION) { return; }
+ for proxy in self.inner.proxies.iter() { if let Some(header) = proxy.http_non_tunnel_basic_auth(dst) { headers.insert(PROXY_AUTHORIZATION, header); break; } }
+ }
+ 
+ fn proxy_custom_headers(&self, dst: &Uri, headers: &mut HeaderMap) {
+ if ! self.inner.proxies_maybe_http_custom_headers { return; }
+ if dst.scheme() != Some(&Scheme::HTTP) { return; }
+ for proxy in self.inner.proxies.iter() { if let Some(iter) = proxy.http_non_tunnel_custom_headers(dst) { iter.iter().for_each(| (key, value) | { headers.insert(key, value.clone()); }); break; } }
+ }
+ 
+}
+
+impl fmt::Debug for Client {
+ fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+ let mut builder = f.debug_struct("Client");
+ self.inner.fmt_fields(&mut builder);
+ builder.finish()
+ }
+ 
+}
+
+impl tower_service::Service<Request> for Client {
+ type Response = Response;
+ type Error = crate::Error;
+ type Future = Pending;
+ fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+ Poll::Ready(Ok(()))
+ }
+ 
+ fn call(&mut self, req: Request) -> Self::Future {
+ self.execute_request(req)
+ }
+ 
+}
+
+impl tower_service::Service<Request> for &Client {
+ type Response = Response;
+ type Error = crate::Error;
+ type Future = Pending;
+ fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+ Poll::Ready(Ok(()))
+ }
+ 
+ fn call(&mut self, req: Request) -> Self::Future {
+ self.execute_request(req)
+ }
+ 
+}
+
+impl fmt::Debug for ClientBuilder {
+ fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+ let mut builder = f.debug_struct("ClientBuilder");
+ self.config.fmt_fields(&mut builder);
+ builder.finish()
+ }
+ 
+}
+
+impl Config {
+ fn fmt_fields(&self, f: &mut fmt::DebugStruct<'_, '_>) {
+ #[cfg(feature = "cookies")] { if let Some(_) = self.cookie_store { f.field("cookie_store", &true); } }
+ f.field("accepts", &self.accepts);
+ if ! self.proxies.is_empty() { f.field("proxies", &self.proxies); }
+ if ! self.redirect_policy.is_default() { f.field("redirect_policy", &self.redirect_policy); }
+ if self.referer { f.field("referer", &true); }
+ f.field("default_headers", &self.headers);
+ if self.http1_title_case_headers { f.field("http1_title_case_headers", &true); }
+ if self.http1_allow_obsolete_multiline_headers_in_responses { f.field("http1_allow_obsolete_multiline_headers_in_responses", &true); }
+ if self.http1_ignore_invalid_headers_in_responses { f.field("http1_ignore_invalid_headers_in_responses", &true); }
+ if self.http1_allow_spaces_after_header_name_in_responses { f.field("http1_allow_spaces_after_header_name_in_responses", &true); }
+ if matches!(self.http_version_pref, HttpVersionPref::Http1) { f.field("http1_only", &true); }
+ #[cfg(feature = "http2")] if matches!(self.http_version_pref, HttpVersionPref::Http2) { f.field("http2_prior_knowledge", &true); }
+ if let Some(ref d) = self.connect_timeout { f.field("connect_timeout", d); }
+ if let Some(ref d) = self.timeout { f.field("timeout", d); }
+ if let Some(ref v) = self.local_address { f.field("local_address", v); }
+ #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "illumos", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "solaris", target_os = "tvos", target_os = "visionos", target_os = "watchos" ))] if let Some(ref v) = self.interface { f.field("interface", v); }
+ if self.nodelay { f.field("tcp_nodelay", &true); }
+ #[cfg(feature = "__tls")] { if ! self.hostname_verification { f.field("tls_danger_accept_invalid_hostnames", &true); } }
+ #[cfg(feature = "__tls")] { if ! self.certs_verification { f.field("tls_danger_accept_invalid_certs", &true); } if let Some(ref min_tls_version) = self.min_tls_version { f.field("tls_version_min", min_tls_version); } if let Some(ref max_tls_version) = self.max_tls_version { f.field("tls_version_max", max_tls_version); } f.field("tls_sni", &self.tls_sni); f.field("tls_info", &self.tls_info); }
+ #[cfg(all(feature = "default-tls", feature = "__rustls"))] { f.field("tls_backend", &self.tls); }
+ if ! self.dns_overrides.is_empty() { f.field("dns_overrides", &self.dns_overrides); }
+ #[cfg(feature = "http3")] { if self.tls_enable_early_data { f.field("tls_enable_early_data", &true); } }
+ #[cfg(unix)] if let Some(ref p) = self.unix_socket { f.field("unix_socket", p); }
+ }
+ 
+}
+
+type MaybeCookieService<T> = T;
+
+type MaybeCookieService<T> = CookieService<T>;
+
+type MaybeDecompression<T> = T;
+
+type MaybeDecompression<T> = Decompression<T>;
+
+type LayeredService<T> = MaybeDecompression<FollowRedirect<MaybeCookieService<tower::retry::Retry<crate::retry::Policy, T>>, TowerRedirectPolicy>>;
+
+type LayeredFuture<T> = Service<http::Request<Body>>::Future;
+
+struct ClientRef {
+ accepts: Accepts,
+ cookie_store: Option<Arc<_>>,
+ headers: HeaderMap,
+ hyper: LayeredService<HyperService>,
+ h3_client: Option<LayeredService<H3Client>>,
+ referer: bool,
+ total_timeout: RequestConfig<TotalTimeout>,
+ read_timeout: Option<Duration>,
+ proxies: Arc<Vec<ProxyMatcher>>,
+ proxies_maybe_http_auth: bool,
+ proxies_maybe_http_custom_headers: bool,
+ https_only: bool,
+ redirect_policy_desc: Option<String>,
+}
+
+impl ClientRef {
+ fn fmt_fields(&self, f: &mut fmt::DebugStruct<'_, '_>) {
+ #[cfg(feature = "cookies")] { if let Some(_) = self.cookie_store { f.field("cookie_store", &true); } }
+ f.field("accepts", &self.accepts);
+ if ! self.proxies.is_empty() { f.field("proxies", &self.proxies); }
+ if let Some(s) = &self.redirect_policy_desc { f.field("redirect_policy", s); }
+ if self.referer { f.field("referer", &true); }
+ f.field("default_headers", &self.headers);
+ self.total_timeout.fmt_as_field(f);
+ if let Some(ref d) = self.read_timeout { f.field("read_timeout", d); }
+ }
+ 
+}
+
+pin_project ! { pub struct Pending { #[pin] inner: PendingInner } }
+enum PendingInner {
+ Request(Pin<Box<PendingRequest>>),
+ Error(Option<crate::Error>),
+}
+
+pin_project ! { struct PendingRequest { method: Method, url: Url, headers: HeaderMap, client: Arc<ClientRef>, #[pin] in_flight: ResponseFuture, #[pin] total_timeout: Option < Pin < Box<Sleep>>>, #[pin] read_timeout_fut: Option < Pin < Box<Sleep>>>, read_timeout: Option<Duration> } }
+enum ResponseFuture {
+ Default(LayeredFuture<HyperService>),
+ H3(LayeredFuture<H3Client>),
+}
+
+impl PendingRequest {
+ fn in_flight(self) -> Pin<&mut ResponseFuture> {
+ self.project().in_flight
+ }
+ 
+ fn total_timeout(self) -> Pin<&mut Option<Pin<Box<Sleep>>>> {
+ self.project().total_timeout
+ }
+ 
+ fn read_timeout(self) -> Pin<&mut Option<Pin<Box<Sleep>>>> {
+ self.project().read_timeout_fut
+ }
+ 
+}
+
+impl Pending {
+ fn new_err(err: crate::Error) -> Pending {
+ Pending { inner: PendingInner::Error(Some(err)) }
+ }
+ 
+ fn inner(self) -> Pin<&mut PendingInner> {
+ self.project().inner
+ }
+ 
+}
+
+impl Future for Pending {
+ type Output = Result<Response, crate::Error>;
+ fn poll(self, cx: &mut Context<'_>) -> Poll<Self::Output> {
+ let inner = self.inner();
+ match inner.get_mut() { PendingInner::Request(ref mut req) => Pin::new(req).poll(cx), PendingInner::Error(ref mut err) => Poll::Ready(Err(err.take().expect("Pending error polled more than once"))) }
+ }
+ 
+}
+
+impl Future for PendingRequest {
+ type Output = Result<Response, crate::Error>;
+ fn poll(self, cx: &mut Context<'_>) -> Poll<Self::Output> {
+ if let Some(delay) = self.as_mut().total_timeout().as_mut().as_pin_mut() { if let Poll::Ready(()) = delay.poll(cx) { return Poll::Ready(Err(crate::error::request(crate::error::TimedOut).with_url(self.url.clone()))); } }
+ if let Some(delay) = self.as_mut().read_timeout().as_mut().as_pin_mut() { if let Poll::Ready(()) = delay.poll(cx) { return Poll::Ready(Err(crate::error::request(crate::error::TimedOut).with_url(self.url.clone()))); } }
+ let res = match self.as_mut().in_flight().get_mut() { ResponseFuture::Default(r) => match ready!(Pin::new(r).poll(cx)) { Err(e) => { return Poll::Ready(Err(e.if_no_url(| | self.url.clone()))); } Ok(res) => res.map(super::body::boxed) }, #[cfg(feature = "http3")] ResponseFuture::H3(r) => match ready!(Pin::new(r).poll(cx)) { Err(e) => { return Poll::Ready(Err(crate::error::request(e).with_url(self.url.clone()))); } Ok(res) => res.map(super::body::boxed) } };
+ if let Some(url) = &res.extensions().get::<tower_http::follow_redirect::RequestUri>() { self.url = match Url::parse(&url.0.to_string()) { Ok(url) => url, Err(e) => return Poll::Ready(Err(crate::error::decode(e))) } };
+ let res = Response::new(res, self.url.clone(), self.total_timeout.take(), self.read_timeout );
+ Poll::Ready(Ok(res))
+ }
+ 
+}
+
+impl fmt::Debug for Pending {
+ fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+ match self.inner { PendingInner::Request(ref req) => f.debug_struct("Pending").field("method", &req.method).field("url", &req.url).finish(), PendingInner::Error(ref err) => f.debug_struct("Pending").field("error", err).finish() }
+ }
+ 
+}
+
+#[cfg(test)]
+# ! [cfg(not(feature = "rustls-no-provider"))]
+mod tests {
+ #[tokio::test]
+ fn execute_request_rejects_invalid_urls() {
+ let url_str = "hxxps://www.rust-lang.org/";
+ let url = url::Url::parse(url_str).unwrap();
+ let result = crate::get(url.clone()).await;
+ assert!(result.is_err());
+ let err = result.err().unwrap();
+ assert!(err.is_builder());
+ assert_eq!(url_str, err.url().unwrap().as_str());
+ }
+ 
+ /// https://github.com/seanmonstar/reqwest/issues/668
+ #[tokio::test]
+ fn execute_request_rejects_invalid_hostname() {
+ let url_str = "https://{{hostname}}/";
+ let url = url::Url::parse(url_str).unwrap();
+ let result = crate::get(url.clone()).await;
+ assert!(result.is_err());
+ let err = result.err().unwrap();
+ assert!(err.is_builder());
+ assert_eq!(url_str, err.url().unwrap().as_str());
+ }
+ 
+ #[test]
+ fn test_future_size() {
+ let s = std::mem::size_of::<super::Pending>();
+ assert!(s < 128, "size_of::<Pending>() == {s}, too big");
+ }
+ 
+}
+

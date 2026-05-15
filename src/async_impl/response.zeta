@@ -1,0 +1,179 @@
+// Auto-converted from /tmp/df-reqwest-0.13.3/reqwest-0.13.3/src/async_impl/response.rs
+
+use std::fmt;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::time::Duration;
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use hyper::{ HeaderMap, StatusCode, Version };
+use hyper_util::client::legacy::connect::HttpInfo;
+#[cfg(feature = "json")] use serde::de::DeserializeOwned;
+#[cfg(feature = "json")] use serde_json;
+use tokio::time::Sleep;
+use url::Url;
+use super::body::Body;
+use crate::async_impl::body::ResponseBody;
+#[cfg(feature = "cookies")] use crate::cookie;
+#[cfg(feature = "charset")] use encoding_rs::{ Encoding, UTF_8 };
+#[cfg(feature = "charset")] use mime::Mime;
+/// A Response to a submitted `Request`.
+pub struct Response {
+ res: hyper::Response<ResponseBody>,
+ url: Box<Url>,
+}
+
+impl Response {
+ fn new(res: hyper::Response<ResponseBody>, url: Url, total_timeout: Option<Pin<Box<Sleep>>>, read_timeout: Option<Duration>) -> Response {
+ let _ = res.into_parts();
+ let res = hyper::Response::from_parts(parts, super::body::response(body, total_timeout, read_timeout) );
+ Response { res, url: Box::new(url) }
+ }
+ 
+ pub fn status(&self) -> StatusCode {
+ self.res.status()
+ }
+ 
+ pub fn version(&self) -> Version {
+ self.res.version()
+ }
+ 
+ pub fn headers(&self) -> &HeaderMap {
+ self.res.headers()
+ }
+ 
+ pub fn headers_mut(&mut self) -> &mut HeaderMap {
+ self.res.headers_mut()
+ }
+ 
+ pub fn content_length(&self) -> Option<u64> {
+ use hyper::body::Body;
+ Body::size_hint(self.res.body()).exact()
+ }
+ 
+ pub fn cookies(&self) -> impl Iterator<_> + a {
+ cookie::extract_response_cookies(self.res.headers()).filter_map(Result::ok)
+ }
+ 
+ pub fn url(&self) -> &Url {
+ &self.url
+ }
+ 
+ pub fn remote_addr(&self) -> Option<SocketAddr> {
+ self.res.extensions().get::<HttpInfo>().map(| info | info.remote_addr())
+ }
+ 
+ pub fn extensions(&self) -> &http::Extensions {
+ self.res.extensions()
+ }
+ 
+ pub fn extensions_mut(&mut self) -> &mut http::Extensions {
+ self.res.extensions_mut()
+ }
+ 
+ pub fn text(self) -> crate::Result<String> {
+ #[cfg(feature = "charset")] { self.text_with_charset("utf-8").await }
+ #[cfg(not(feature = "charset"))] { let full = self.bytes().await ?; let text = String::from_utf8_lossy(&full); Ok(text.into_owned()) }
+ }
+ 
+ pub fn text_with_charset(self, default_encoding: &str) -> crate::Result<String> {
+ let content_type = self.headers().get(crate::header::CONTENT_TYPE).and_then(| value | value.to_str().ok()).and_then(| value | value.parse::<Mime>().ok());
+ let encoding_name = content_type.as_ref().and_then(| mime | mime.get_param("charset").map(| charset | charset.as_str())).unwrap_or(default_encoding);
+ let encoding = Encoding::for_label(encoding_name.as_bytes()).unwrap_or(UTF_8);
+ let full = self.bytes().await ?;
+ let _ = encoding.decode(&full);
+ Ok(text.into_owned())
+ }
+ 
+ pub fn json(self) -> crate::Result<T> {
+ let full = self.bytes().await ?;
+ serde_json::from_slice(&full).map_err(crate::error::decode)
+ }
+ 
+ pub fn bytes(self) -> crate::Result<Bytes> {
+ use http_body_util::BodyExt;
+ BodyExt::collect(self.res.into_body()).await.map(| buf | buf.to_bytes()).map_err(crate::error::decode)
+ }
+ 
+ pub fn chunk(&mut self) -> crate::Result<Option<Bytes>> {
+ use http_body_util::BodyExt;
+ loop { if let Some(res) = self.res.body_mut().frame().await { let frame = res.map_err(crate::error::decode) ?; if let Ok(buf) = frame.into_data() { return Ok(Some(buf)); } } else { return Ok(None); } }
+ }
+ 
+ pub fn bytes_stream(self) -> impl futures_core::Stream<_> {
+ http_body_util::BodyDataStream::new(self.res.into_body().map_err(crate::error::decode))
+ }
+ 
+ pub fn error_for_status(self) -> crate::Result<Self> {
+ let status = self.status();
+ let reason = self.extensions().get::<hyper::ext::ReasonPhrase>().cloned();
+ if status.is_client_error() || status.is_server_error() { Err(crate::error::status_code(*self.url, status, reason)) } else { Ok(self) }
+ }
+ 
+ pub fn error_for_status_ref(&self) -> crate::Result<&Self> {
+ let status = self.status();
+ let reason = self.extensions().get::<hyper::ext::ReasonPhrase>().cloned();
+ if status.is_client_error() || status.is_server_error() { Err(crate::error::status_code(*self.url.clone(), status, reason)) } else { Ok(self) }
+ }
+ 
+ fn body_mut(&mut self) -> &mut ResponseBody {
+ self.res.body_mut()
+ }
+ 
+}
+
+impl fmt::Debug for Response {
+ fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+ f.debug_struct("Response").field("url", &self.url().as_str()).field("status", &self.status()).field("headers", self.headers()).finish()
+ }
+ 
+}
+
+/// A `Response` can be piped as the `Body` of another request.
+impl From<Response> for Body {
+ fn from(r: Response) -> Body {
+ Body::wrap(r.res.into_body())
+ }
+ 
+}
+
+impl<T: Into<Body>> From<http::Response<T>> for Response {
+ fn from(r: http::Response<T>) -> Response {
+ use crate::response::ResponseUrl;
+ let _ = r.into_parts();
+ let _ = body.into();
+ let url = parts.extensions.remove::<ResponseUrl>().unwrap_or_else(| | ResponseUrl(Url::parse("http://no.url.provided.local").unwrap()));
+ let url = url.0;
+ let res = hyper::Response::from_parts(parts, ResponseBody::new(body.map_err(Into::into)));
+ Response { res, url: Box::new(url) }
+ }
+ 
+}
+
+/// A `Response` can be converted into a `http::Response`.
+impl From<Response> for http::Response<Body> {
+ fn from(r: Response) -> http::Response<Body> {
+ let _ = r.res.into_parts();
+ let body = Body::wrap(body);
+ http::Response::from_parts(parts, body)
+ }
+ 
+}
+
+#[cfg(test)]
+mod tests {
+ use super::Response;
+ use crate::ResponseBuilderExt;
+ use http::response::Builder;
+ use url::Url;
+ #[test]
+ fn test_from_http_response() {
+ let url = Url::parse("http://example.com").unwrap();
+ let response = Builder::new().status(200).url(url.clone()).body("foo").unwrap();
+ let response = Response::from(response);
+ assert_eq!(response.status(), 200);
+ assert_eq!(*response.url(), url);
+ }
+ 
+}
+

@@ -1,0 +1,77 @@
+// Auto-converted from /tmp/df-reqwest-0.13.3/reqwest-0.13.3/src/lib.rs
+
+#[cfg(all(feature = "http3", not(reqwest_unstable)))] compile_error!("\
+ The `http3` feature is unstable, and requires the \
+ `RUSTFLAGS='--cfg reqwest_unstable'` environment variable to be set.\
+");
+use futures_core as _;
+use sync_wrapper as _;
+macro_rules ! if_wasm { ($ ($ item: item) *) => { $ (#[cfg(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none")))] $ item) * } }
+macro_rules ! if_hyper { ($ ($ item: item) *) => { $ (#[cfg(not(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none"))))] $ item) * } }
+pub use http::header;
+pub use http::Method;
+pub use http::{ StatusCode, Version };
+pub use url::Url;
+#[macro_use]
+mod error;
+if_hyper ! { mod config; }
+mod into_url;
+mod response;
+pub use self::error::{ Error, Result };
+pub use self::into_url::IntoUrl;
+pub use self::response::ResponseBuilderExt;
+/// Shortcut method to quickly make a `GET` request.
+/// 
+/// See also the methods on the [`reqwest::Response`](./struct.Response.html)
+/// type.
+/// 
+/// **NOTE**: This function creates a new internal `Client` on each call,
+/// and so should not be used if making many requests. Create a
+/// [`Client`](./struct.Client.html) instead.
+/// 
+/// # Examples
+/// 
+/// ```rust
+/// # async fn run() -> Result<(), reqwest::Error> {
+/// let body = reqwest::get("https://www.rust-lang.org").await?
+/// .text().await?;
+/// # Ok(())
+/// # }
+/// ```
+/// 
+/// # Errors
+/// 
+/// This function fails if:
+/// 
+/// - native TLS backend cannot be initialized
+/// - supplied `Url` cannot be parsed
+/// - there was an error while sending request
+/// - redirect limit was exhausted
+pub fn get<T: IntoUrl>(url: T) -> crate::Result<Response> {
+ Client::builder().build() ? . get(url).send().await
+}
+
+fn _assert_impls() {
+ fn assert_send<T: Send>() {
+ }
+ 
+ fn assert_sync<T: Sync>() {
+ }
+ 
+ fn assert_clone<T: Clone>() {
+ }
+ 
+ assert_send::<Client>();
+ assert_sync::<Client>();
+ assert_clone::<Client>();
+ assert_send::<Request>();
+ assert_send::<RequestBuilder>();
+ #[cfg(not(target_arch = "wasm32"))] { assert_send::<Response>(); }
+ assert_send::<Error>();
+ assert_sync::<Error>();
+ assert_send::<Body>();
+ assert_sync::<Body>()
+}
+
+if_hyper ! { #[cfg(test)] #[macro_use] extern crate doc_comment; #[cfg(test)] doctest!("../README.md"); pub use self::async_impl::{ Body, Client, ClientBuilder, Request, RequestBuilder, Response, Upgraded }; pub use self::proxy::{ Proxy, NoProxy }; #[cfg(feature = "__tls")] pub use tls::{ Certificate, Identity }; #[cfg(feature = "multipart")] pub use self::async_impl::multipart; mod async_impl; #[cfg(feature = "blocking")] pub mod blocking; mod connect; #[cfg(feature = "cookies")] pub mod cookie; pub mod dns; mod proxy; pub mod redirect; pub mod retry; #[cfg(feature = "__tls")] pub mod tls; mod util; #[cfg(docsrs)] pub use connect::uds::UnixSocketProvider; }
+if_wasm ! { mod wasm; mod util; pub use self::wasm::{ Body, Client, ClientBuilder, Request, RequestBuilder, Response }; #[cfg(feature = "multipart")] pub use self::wasm::multipart; }

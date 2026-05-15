@@ -1,0 +1,146 @@
+// Auto-converted from /tmp/df-reqwest-0.13.3/reqwest-0.13.3/src/dns/resolve.rs
+
+use hyper_util::client::legacy::connect::dns::Name as HyperName;
+use tower_service::Service;
+use std::collections::HashMap;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::task::{ Context, Poll };
+use crate::error::BoxError;
+pub type Addrs = Box<_>;
+
+pub type Resolving = Pin<Box<_>>;
+
+/// Trait for customizing DNS resolution in reqwest.
+pub trait Resolve {
+ fn resolve(&self, name: Name) -> Resolving
+}
+
+/// A name that must be resolved to addresses.
+#[derive(Debug)]
+pub struct Name {
+ (HyperName),
+}
+
+/// A more general trait implemented for types implementing `Resolve`.
+/// 
+/// Unnameable, only exported to aid seeing what implements this.
+pub trait IntoResolve {
+ fn into_resolve(self) -> Arc<_>
+}
+
+impl Name {
+ pub fn as_str(&self) -> &str {
+ self.0.as_str()
+ }
+ 
+}
+
+impl FromStr for Name {
+ type Err = sealed::InvalidNameError;
+ fn from_str(host: &str) -> Result<Self, Self::Err> {
+ HyperName::from_str(host).map(Name).map_err(| _ | sealed::InvalidNameError { _ext: () })
+ }
+ 
+}
+
+#[derive(Clone)]
+struct DynResolver {
+ resolver: Arc<_>,
+}
+
+impl DynResolver {
+ fn new(resolver: Arc<_>) -> Self {
+ Self { resolver }
+ }
+ 
+ fn gai() -> Self {
+ Self::new(Arc::new(super::gai::GaiResolver::new()))
+ }
+ 
+ fn http_resolve(&self, target: &http::Uri) -> Result<impl Iterator<_>, BoxError> {
+ let host = target.host().ok_or("missing host") ?;
+ let port = target.port_u16().unwrap_or_else(| | match target.scheme_str() { Some("https") => 443, Some("socks4") | Some("socks4a") | Some("socks5") | Some("socks5h") => 1080, _ => 80 });
+ let explicit_port = target.port().is_some();
+ let addrs = self.resolver.resolve(host.parse() ?).await ?;
+ Ok(addrs.map(move | mut addr | { if explicit_port || addr.port() == 0 { addr.set_port(port); } addr }))
+ }
+ 
+}
+
+impl Service<HyperName> for DynResolver {
+ type Response = Addrs;
+ type Error = BoxError;
+ type Future = Resolving;
+ fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+ Poll::Ready(Ok(()))
+ }
+ 
+ fn call(&mut self, name: HyperName) -> Self::Future {
+ self.resolver.resolve(Name(name))
+ }
+ 
+}
+
+struct DnsResolverWithOverrides {
+ dns_resolver: Arc<_>,
+ overrides: Arc<HashMap<String, Vec<SocketAddr>>>,
+}
+
+impl DnsResolverWithOverrides {
+ fn new(dns_resolver: Arc<_>, overrides: HashMap<String, Vec<SocketAddr>>) -> Self {
+ DnsResolverWithOverrides { dns_resolver, overrides: Arc::new(overrides) }
+ }
+ 
+}
+
+impl Resolve for DnsResolverWithOverrides {
+ fn resolve(&self, name: Name) -> Resolving {
+ match self.overrides.get(name.as_str()) { Some(dest) => { let addrs: Addrs = Box::new(dest.clone().into_iter()); Box::pin(std::future::ready(Ok(addrs))) } None => self.dns_resolver.resolve(name) }
+ }
+ 
+}
+
+impl IntoResolve for Arc<_> {
+ fn into_resolve(self) -> Arc<_> {
+ self
+ }
+ 
+}
+
+impl<R> IntoResolve for Arc<R> where R: Resolve + static {
+ fn into_resolve(self) -> Arc<_> {
+ self
+ }
+ 
+}
+
+impl<R> IntoResolve for R where R: Resolve + static {
+ fn into_resolve(self) -> Arc<_> {
+ Arc::new(self)
+ }
+ 
+}
+
+mod sealed {
+ use std::fmt;
+ #[derive(Debug)]
+ pub struct InvalidNameError {
+ _ext: (),
+ }
+ 
+ impl fmt::Display for InvalidNameError {
+ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+ f.write_str("invalid DNS name")
+ }
+ 
+ }
+ 
+ impl std::error::Error for InvalidNameError {
+ }
+ 
+}
+

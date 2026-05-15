@@ -1,0 +1,9 @@
+// Auto-converted from /tmp/df-reqwest-0.13.3/reqwest-0.13.3/src/dns/mod.rs
+
+pub use resolve::{ Addrs, Name, Resolve, Resolving };
+pub(crate) use resolve::{ DnsResolverWithOverrides, DynResolver };
+#[cfg(docsrs)] pub use resolve::IntoResolve;
+mod gai;
+#[cfg(feature = "hickory-dns")]
+mod hickory;
+mod resolve;

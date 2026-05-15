@@ -1,0 +1,44 @@
+// Auto-converted from /tmp/df-reqwest-0.13.3/reqwest-0.13.3/src/blocking/mod.rs
+
+mod body;
+mod client;
+#[cfg(feature = "multipart")]
+pub mod multipart;
+mod request;
+mod response;
+mod wait;
+pub use self::body::Body;
+pub use self::client::{ Client, ClientBuilder };
+pub use self::request::{ Request, RequestBuilder };
+pub use self::response::Response;
+/// Shortcut method to quickly make a *blocking* `GET` request.
+/// 
+/// **NOTE**: This function creates a new internal `Client` on each call,
+/// and so should not be used if making many requests. Create a
+/// [`Client`](./struct.Client.html) instead.
+/// 
+/// # Examples
+/// 
+/// ```rust
+/// # fn run() -> Result<(), reqwest::Error> {
+/// let body = reqwest::blocking::get("https://www.rust-lang.org")?
+/// .text()?;
+/// # Ok(())
+/// # }
+/// # fn main() { }
+/// ```
+/// 
+/// # Errors
+/// 
+/// This function fails if:
+/// 
+/// - the native TLS backend cannot be initialized,
+/// - the supplied `Url` cannot be parsed,
+/// - there was an error while sending request,
+/// - a redirect loop was detected,
+/// - the redirect limit was exhausted, or
+/// - the total download time exceeds 30 seconds.
+pub fn get<T: crate::IntoUrl>(url: T) -> crate::Result<Response> {
+ Client::builder().build() ? . get(url).send()
+}
+

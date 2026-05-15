@@ -1,0 +1,35 @@
+// Auto-converted from /tmp/df-reqwest-0.13.3/reqwest-0.13.3/src/async_impl/h3_client/dns.rs
+
+use core::task;
+use hyper_util::client::legacy::connect::dns::Name;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::task::Poll;
+use tower_service::Service;
+pub trait Resolve {
+ type Addrs;
+ type Error;
+ type Future;
+ fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>>;
+ fn resolve(&mut self, name: Name) -> Self::Future
+}
+
+impl<S> Resolve for S where S: Service<Name>, S::Response: Iterator<_>, S::Error: Into<Box<_>> {
+ type Addrs = S::Response;
+ type Error = S::Error;
+ type Future = S::Future;
+ fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Self::Error>> {
+ Service::poll_ready(self, cx)
+ }
+ 
+ fn resolve(&mut self, name: Name) -> Self::Future {
+ Service::call(self, name)
+ }
+ 
+}
+
+fn resolve<R>(resolver: &mut R, name: Name) -> Result<R::Addrs, R::Error> where R: Resolve {
+ std::future::poll_fn(| cx | resolver.poll_ready(cx)).await ?;
+ resolver.resolve(name).await
+}
+
